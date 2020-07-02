@@ -1,0 +1,277 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(R.utils)
+library(eurostat)
+library(readxl)
+library(reshape2)
+library(plotly)
+```
+
+```{r}
+data=gunzip("demo_r_mweek3.tsv.gz")
+data=read.table("demo_r_mweek3.tsv", sep = '\t', header = TRUE)
+```
+
+```{r}
+data %>% head()
+```
+structuring the data and making selections
+
+```{r}
+data=data %>% separate(unit.sex.age.geo.time, into = c("unit", "sex","age","geo"), sep = ",") %>% select(-unit) %>% filter(age %in% c("TOTAL", "Y75-79", "Y80-84","Y85-89","Y_GE90")) %>% melt(id=c("sex","age","geo")) %>% separate(variable, into = c("Year", "Week"), sep = "W") %>% mutate(Year=gsub("X","", Year)) %>% filter(Year %in% c("2020", "2019", "2018", "2017", "2016", "2015"))
+```
+#Total deaths (all ages both sex)
+
+calculating excess for the weeks 10 to 19 which correspond to March and first week of May
+
+```{r}
+notinclude=data %>% filter(sex=="T", age=="TOTAL") %>% select(-sex, -age) %>% separate(value, into = c("value", "comment"), sep = " ") %>% filter(value!=":") %>% mutate(value=as.numeric(value)) %>% group_by(geo) %>% distinct(Year) %>% count() %>% filter(n<4) %>% pull(geo) 
+
+
+totalexcess=data %>% filter(sex=="T", age=="TOTAL", !geo %in% notinclude, Week !=53) %>% select(-sex, -age) %>% separate(value, into = c("value", "comment"), sep = " ") %>% filter(value!=":") %>% mutate(value=as.numeric(value)) %>%  dcast(geo+Week~Year, value.var = "value") %>% mutate(avg=ifelse(is.na(`2015`),(`2016`+`2017`+`2018`+`2019`)/4, ifelse(is.na(`2019`), (`2015`+`2016`+`2017`+`2018`)/4, (`2015`+`2016`+`2017`+`2018`+`2019`)/5))) %>% select(geo, Week, avg, `2020`)
+
+
+```
+```{r}
+data%>% filter(sex=="T", age=="TOTAL", grepl("HU|RS", geo), Week !=53) %>% separate(value, into = c("value", "comment"), sep = " ") %>% filter(value!=":")%>% mutate(value=as.numeric(value)) %>%  dcast(geo+Week~Year, value.var = "value")
+```
+
+Excluding countries with no data
+
+```{r}
+totalexcess %>% filter(!is.na(`2020`)) %>%group_by(geo) %>%  filter(Week==max(Week)) %>% mutate(no=str_length(geo)) %>% filter(no==2)
+
+weeks10_19=totalexcess %>%mutate(Week=as.numeric(Week)) %>%  filter(Week>=10, Week<=ifelse(grepl("CZ", geo),18, ifelse(grepl("LU", geo), 17, ifelse(grepl("SK", geo), 18, 19))))  %>% group_by(geo) %>% summarise(total2020=sum(`2020`), totalavg=sum(avg)) %>% mutate(excess=round((total2020-totalavg)/totalavg*100,1)) #%>% write.csv("firsttest.csv")
+```
+
+Some countries are not included in the data or not by regional division. Getting it from stats offices
+
+
+# UK
+
+```{r}
+ENG=read_excel("lahbtablesweek24.xlsx", sheet = "Registrations - All data", skip = 2)
+ENG=ENG %>% filter(`Geography type`=="Local Authority")
+Fiveyears=read_excel("weeklyfiveyear20152019.xlsx", sheet = 2, skip = 2)
+SCOT=read.csv("weekly-deaths-by-date-council-area-location_Data.csv", skip = 2)
+Fivescot=read.csv("SCOT_5avg.csv", skip = 2)
+NUTS=read.csv("NUTS_UK_OK.csv")
+```
+
+```{r}
+ENG
+```
+
+
+```{r}
+ENG_excess=merge(
+  ENG %>% filter(`Cause of death`=="All causes", `Week number`>=10, `Week number`<=19) %>% group_by(`Area code`, `Area name`) %>% summarise(Alldeaths=sum(`Number of deaths`)),
+
+Fiveyears %>% filter(`Week Number`>=10, `Week Number`<=19) %>% mutate(`Local Authority Code`=ifelse(`Local Authority Code` %in% c("E07000004", "E07000005","E07000006", "E07000007"), "E06000060", `Local Authority Code`))%>% mutate(`Local Authority Name`=ifelse(`Local Authority Name` %in% c("Aylesbury Vale", "Chiltern","South Bucks", "Wycombe"), "Buckinghamshire", `Local Authority Name`)) %>% group_by(`Local Authority Code`, `Local Authority Name`) %>% summarise(avg=sum(`Five year average number of deaths`)) %>% rename("Area code"="Local Authority Code", "Area name"="Local Authority Name"),
+by=c("Area code", "Area name"))
+
+```
+
+```{r}
+Scot_excess=merge(SCOT %>% filter(Week.of.occurrence !="") %>%mutate(Week=as.numeric(Week.of.occurrence)) %>% arrange(Week)%>% group_by(Week, Council) %>% summarise(totaldeaths=sum(deaths))%>%  filter(Week>=10, Week<=19) %>% group_by(Council) %>% summarise(totaldeaths=sum(totaldeaths)),
+      Fivescot %>% mutate(Week=as.numeric(Week))%>%  filter(Week>=10, Week<=19) %>% group_by(Council.area, Year) %>% summarise(deaths=sum(Number.of.deaths)) %>% group_by(Council.area) %>% summarise(avg=mean(deaths)) %>% rename("Council"="Council.area"),by="Council")
+
+#Adding codes
+codesscot=read.csv("Scot_deaths.csv", skip = 2)
+codesscot=codesscot %>% distinct(Council.Area, Council.area.code)
+colnames(codesscot)=c("Council", "Code")
+
+Scot_excess=Scot_excess %>% left_join(codesscot, by="Council")
+```
+For most of the countries, the NUTS division is similar or the same as the regional division. But not for the UK (" what a surprised" + sigh). So I use a lookup from lower tier local authorities (the geographical division in which deaths are published in the UK) and NUTS level 3. Dataset comes from the geoportal of the ONS.
+
+```{r}
+colnames(ENG_excess)=c("Code", "Name", "Deaths", "Avg")
+colnames(Scot_excess)=c("Name", "Deaths", "Avg", "Code")
+colnames(NUTS)[1]="Code"
+colnames(NUTS)[2]="Name"
+```
+
+```{r}
+UK=rbind(ENG_excess,Scot_excess)
+
+UK=UK %>% left_join(NUTS, by=c("Code", "Name")) %>% mutate(NUTS.2=ifelse(Name=="Glasgow City", "UKM8", ifelse(Name=="North Lanarkshire", "UKM8", ifelse(Name=="Perth and Kinross", "UKM7",ifelse(Name=="Fife", "UKM7", ifelse(Name=="Na h-Eileanan Siar", "UKM6", as.character(NUTS.2))))))) %>% mutate(NUTS.3=ifelse(Name=="Glasgow City", "UKM82", ifelse(Name=="North Lanarkshire", "UKM84", ifelse(Name=="Perth and Kinross", "UKM77",ifelse(Name=="Fife", "UKM72", ifelse(Name=="Na h-Eileanan Siar", "UKM64", as.character(NUTS.3)))))))
+
+UK_nuts=UK %>% select(NUTS.3, Deaths, Avg) %>% rename("geo"="NUTS.3") %>% group_by(geo) %>% summarise(Deaths=sum(Deaths), Avg=sum(Avg)) %>% rbind(UK %>%select(NUTS.2, Deaths, Avg) %>% group_by(NUTS.2) %>% summarise(Deaths=sum(Deaths), Avg=sum(Avg))%>% rename("geo"="NUTS.2") ) %>% rename("total2020"="Deaths", "totalavg"="Avg") %>% mutate(excess=round((total2020-totalavg)/totalavg*100,1))
+```
+
+Data for Northern Ireland not included because there are no information of the 5 year average per local authority. Double checked with NISRA. 
+
+# The Netherlands and Germany
+
+##Netherlands
+
+```{r}
+NE=read_excel("Netherlands.xlsx", sheet = 2, skip = 2)
+NE$...4=NULL
+colnames(NE)[1]="Year"
+colnames(NE)[2]="Week"
+NE=NE %>% filter(!is.na(Week), !Week %in% c("Ontvangen2", "Week 25*")) %>% fill(Year) %>% mutate(Week=gsub(c("Week||\\*$|\\*[0-9]"),"", Week), Week=as.numeric(Week))
+colnames(NE)[3]="NL"
+
+NE=full_join(NE %>% filter(Year %in% c("2019", "2018", "2017")) %>% mutate(NL=as.numeric(NL)) %>% group_by(Week) %>% summarise_if(is.numeric, funs(mean)) %>% melt(id="Week") %>% rename("geo"="variable", "Avg"="value"),
+
+NE %>% filter(Year=="2020") %>% select(-Year) %>%melt(id="Week") %>% rename("geo"="variable", "deaths"="value"))
+
+NE_Nuts=NE %>% filter(Week>=10, Week<=19) %>% group_by(geo) %>% summarise(totalavg=round(sum(Avg),1), total2020=sum(as.numeric(deaths))) %>% mutate(excess=round((total2020-totalavg)/totalavg*100,1))
+```
+
+```{r}
+NE_Nuts=NE_Nuts %>% mutate(geo=ifelse(geo=="Groningen", "NL11", ifelse(geo=="Friesland", "NL12", ifelse(geo=="Drenthe", "NL13",ifelse(geo=="Overijssel", "NL21", ifelse(geo=="Flevoland", "NL23", ifelse(geo=="Gelderland", "NL22", ifelse(geo=="Utrecht", "NL31",ifelse(geo=="Noord-Holland", "NL32",ifelse(geo=="Zuid-Holland", "NL33",ifelse(geo=="Zeeland", "NL34",ifelse(geo=="Noord-Brabant", "NL41",ifelse(geo=="Limburg", "NL42",as.character(geo))))))))))))))
+```
+
+##Germany
+```{r}
+GE=read_excel("Germany.xlsx", sheet = "BL_2016_2020_Wochen_AG", skip = 8)
+colnames(GE)[1]="geo"
+colnames(GE)[2]="Year"
+colnames(GE)[3]="Type"
+
+DE_toNUTS=full_join(GE %>% filter(Type=="Insgesamt", Year %in%c("2016","2017", "2018","2019")) %>% melt(id=c("geo","Year","Type")) %>% rename("Week"="variable") %>% mutate(value=as.numeric(value)) %>% group_by(geo, Week) %>% summarise(avg=mean(value)),
+
+GE%>% filter(Type=="Insgesamt", Year==2020) %>% melt(id=c("geo","Year","Type")) %>% rename("Week"="variable", "deaths"="value") %>% select(geo, Week, deaths), by=c("geo", "Week")) %>% mutate(Week=as.numeric(Week)) %>% filter(Week>=10, Week<=19) %>% group_by(geo) %>% summarise(totalavg=round(sum(avg),1), total2020=sum(as.numeric(deaths))) %>% mutate(excess=round((total2020-totalavg)/totalavg*100,1)) %>% mutate(geo=gsub("Deutschland", "DE", geo))
+
+DE_toNUTS=DE_toNUTS %>% mutate(geo=ifelse(geo!="DE", paste0("DE-",geo),geo))
+```
+
+I couldn't find anything better than Bundeslands, but still relevant to have regional division in Germany. Difficult to exclude this country from the analysis just because data is not by NUTS
+
+#Joining with EU and cleaning some small countries. 
+
+```{r}
+
+#Cleaning total DE (added later) and small countries
+weeks10_19=weeks10_19%>% filter(!is.na(excess), geo!="DE")
+weeks10_19=weeks10_19 %>% filter(!grepl("IS", geo))
+weeks10_19=weeks10_19 %>% filter(!grepl("LI", geo))
+
+#Joining NL and DE
+weeks10_19=rbind(weeks10_19,NE_Nuts,DE_toNUTS, UK_nuts)
+
+#Adding column with number of characters in geo
+weeks10_19=weeks10_19%>% mutate(no=str_length(geo))%>% mutate(no=ifelse(grepl("DE-",geo),5,no))
+```
+
+
+```{r}
+#Summing with country code 2 and 4 or 5 is different because of the UK
+weeks10_19%>% filter(no==2)%>% mutate(diff=(total2020-totalavg)) %>% arrange(geo) #%>% summarise(sum(diff))
+
+weeks10_19 %>% filter(no==ifelse(grepl(c("AT|NL"),geo),4,5)) %>% mutate(diff=(total2020-totalavg)) %>% mutate(country=substr(geo, 1,2)) %>% group_by(country) %>% summarise(diff=sum(diff))%>% arrange(country) %>% summarise(sum(diff))
+```
+
+
+```{r}
+
+#total
+weeks10_19  %>% filter(no==ifelse(grepl(c("AT|NL"),geo),4,5)) %>% mutate(diff=(total2020-totalavg)) %>% summarise(diff=sum(diff), excess=sum(diff)/sum(totalavg))
+
+
+weeks10_19 %>% filter(no==ifelse(grepl(c("AT|NL"),geo),4,5)) %>% arrange(desc(excess)) %>% mutate(diff=(total2020-totalavg))  %>% filter(total2020>30) #%>% summarise(sum(diff))
+
+61695.6/205342.1
+
+```
+
+
+```{r}
+#To write.csv
+labels=read.csv("labels.csv")
+
+weeks10_19%>% filter(no==ifelse(grepl(c("AT|NL"),geo),4,5)) %>% mutate(country=ifelse(grepl("AT", geo), "Austria", ifelse(grepl("BE", geo), "Belgium", ifelse(grepl("BG", geo), "Bulgaria",ifelse(grepl("CH", geo), "Switzerland",ifelse(grepl("CZ", geo), "Czech Republic",ifelse(grepl("DE", geo), "Germany",ifelse(grepl("DK", geo), "Denmark",ifelse(grepl("ES", geo), "Spain",ifelse(grepl("FI", geo), "Finland",ifelse(grepl("FR", geo), "France",ifelse(grepl("IT", geo), "Italy",ifelse(grepl("LU", geo), "Luxembourg",ifelse(grepl("NL", geo), "Netherlands",ifelse(grepl("NO", geo), "Norway",ifelse(grepl("PT", geo), "Portugal",ifelse(grepl("SE", geo), "Sweden",ifelse(grepl("SK", geo), "Slovakia",ifelse(grepl("UK", geo), "United Kingdoms", ifelse(grepl("LT", geo), "Lithuania",geo)))))))))))))))))))) %>% left_join(labels, by="geo") %>% write.csv("map2.csv")
+```
+
+
+# Population - are areas with older populations most hit?
+
+```{r}
+population=read.csv("population_age_europe.csv")
+population=population %>% filter(TIME=="2019", !grepl("AL", GEO)) %>% mutate(Value=as.numeric(gsub(",","", Value)))
+
+population=population %>% select(GEO,AGE, Value) %>% dcast(GEO~AGE) %>% mutate(over75=(`From 85 to 89 years`+`From 80 to 84 years`+`From 75 to 79 years`+`90 years or over`), pct=round(over75/Total*100,1))
+```
+```{r}
+weeks10_19 %>% mutate(no=str_length(geo)) %>% filter(no==ifelse(grepl("AT",geo),4,5)) %>% left_join(population %>% rename("geo"="GEO") %>% select(geo, pct)) %>% ggplot(aes(x=excess, y=pct))+geom_point()
+
+oldpop=weeks10_19 %>% mutate(no=str_length(geo)) %>% filter(no==ifelse(grepl("AT",geo),4,5)) %>% left_join(population %>% rename("geo"="GEO")%>% select(geo, pct))
+cor.test(oldpop$pct, oldpop$excess)
+```
+
+#Density - Any correlation between density and deaths?
+
+```{r}
+density=read.csv("density_eruope.csv")
+density=density %>% filter(TIME=="2018")%>% mutate(Value=as.numeric(gsub(",","", Value)))
+weeks10_19 %>% mutate(no=str_length(geo)) %>% filter(no==ifelse(grepl("AT",geo),4,5)) %>% left_join(density %>% rename("geo"="GEO") %>% select(geo, Value)) %>% ggplot(aes(x=excess, y=Value))+geom_point()
+cordensity=weeks10_19 %>% mutate(no=str_length(geo)) %>% filter(no==ifelse(grepl("AT",geo),4,5)) %>% left_join(density %>% rename("geo"="GEO") %>% select(geo, Value))
+cor.test(cordensity$Value, cordensity$excess)
+```
+
+# Gender
+```{r}
+head(data)
+gender=data %>% mutate(no=str_length(geo)) %>% filter(no==2, age=="TOTAL", sex != "T", Year=="2020", !geo %in% c("EE","HR","HU","IS","LI","ME","RS","SI","LV")) %>% mutate(Week=as.numeric(Week))%>%  filter(Week>=10, Week<=ifelse(grepl("CZ", geo),18, ifelse(grepl("LU", geo), 17, ifelse(grepl("SK", geo), 18, 19)))) %>% separate(value, into = c("value", "comment"), sep = " ") %>% mutate(value=as.numeric(value)) %>% select(sex, geo, Week, value)
+
+gender %>% group_by(sex, geo) %>% summarise(total=sum(value)) %>% dcast(geo~sex, value.var = "total") %>% mutate(pctMale=round(M/(F+M)*100,1))
+
+
+weeks10_19%>% filter(no==2) %>% mutate(diff)
+```
+
+
+# Age groups
+
+```{r}
+age=data %>% mutate(no=str_length(geo)) %>% filter(no==2, age!="TOTAL", sex == "T", !geo %in% c("EE","HR","HU","IS","LI","ME","RS","SI","LV","UK","LU")) %>% mutate(Week=as.numeric(Week)) %>% filter(Week !=53) %>% separate(value, into = c("value", "comment"), sep = " ") %>% mutate(value=as.numeric(gsub(":","",value))) %>% group_by(geo, Year, Week) %>% summarise(over75=sum(value)) %>% dcast(geo+Week~Year, value.var = "over75") %>% mutate(avg=round((`2015`+`2016`+`2017`+`2018`+`2019`)/5,1)) %>% select(geo, Week, `2020`, avg)
+
+age %>% filter(Week>=10, Week<=ifelse(geo=="CZ", 18, 19)) %>% group_by(geo) %>% summarise(total=sum(`2020`), avg=sum(avg), excess=(total-avg)/avg*100)
+```
+
+
+
+```{r}
+age %>% filter(Week>=10, Week<=ifelse(geo=="CZ", 18, 19)) %>% group_by(geo) %>% summarise(total=sum(`2020`), avg=sum(avg)) %>% 
+  melt() %>% ggplot(aes(x=geo, y=value, fill=variable))+geom_col(position="dodge", stat="identity")+coord_flip()
+```
+
+
+```{r}
+under45=data %>% mutate(no=str_length(geo)) %>% filter(no==2, sex == "T", !geo %in% c("EE","HR","HU","IS","LI","ME","RS","SI","LV","UK","LU")) %>% mutate(Week=as.numeric(Week)) %>% filter(Week !=53) %>% separate(value, into = c("value", "comment"), sep = " ") %>% mutate(value=as.numeric(gsub(":","",value))) %>%mutate(agegroup=ifelse(age=="TOTAL", "TOTAL", "OVER75")) %>% group_by(geo, Year, Week, agegroup) %>% summarise(over75=sum(value)) %>% dcast(geo+Year+Week~agegroup) %>% mutate(under75=TOTAL-OVER75) %>% select(geo, Year, Week, under75)%>% dcast(geo+Week~Year, value.var = "under75") %>% mutate(avg=round((`2015`+`2016`+`2017`+`2018`+`2019`)/5,1)) %>% select(geo, Week, `2020`, avg)
+
+under45%>% filter(Week>=10, Week<=ifelse(geo=="CZ", 18, 19)) %>% group_by(geo) %>% summarise(total=sum(`2020`), avg=sum(avg), excess=(total-avg)/avg*100)
+
+under45%>% filter(Week>=10, Week<=ifelse(geo=="CZ", 18, 19)) %>% group_by(geo) %>% summarise(total=sum(`2020`), avg=sum(avg)) %>% 
+  melt() %>% ggplot(aes(x=geo, y=value, fill=variable))+geom_col(position="dodge", stat="identity")+coord_flip()
+```
+
+```{r}
+under45%>% filter(Week>=10, Week<=ifelse(geo=="CZ", 18, 19)) %>% group_by(geo) %>% summarise(total=sum(`2020`), avg=sum(avg)) %>% write.csv("under45.csv")
+age %>% filter(Week>=10, Week<=ifelse(geo=="CZ", 18, 19)) %>% group_by(geo) %>% summarise(total=sum(`2020`), avg=sum(avg)) %>% write.csv("under75.csv")
+```
+
+```{r}
+GE %>% filter(Type !="Insgesamt", geo=="Deutschland") %>% melt(id=c("geo","Year","Type")) %>% mutate(variable=as.numeric(variable)) %>% filter(variable>=10, variable<=19) %>% mutate(value=as.numeric(value)) %>% group_by(Year, Type) %>% summarise(value=sum(value)) %>% dcast(Type~Year) %>% mutate(avg=(`2016`+`2017`+`2018`+`2019`)/4, excess=)
+```
+
+# Total excess to visualisation
+
+```{r}
+DE_total=GE %>% filter(geo=="Deutschland", Type=="Insgesamt") %>%select(-Type) %>%  melt(id=c("geo", "Year")) %>% mutate(geo="DE") %>% mutate(value=as.numeric(value)) %>%  dcast(geo+variable~Year) %>% mutate(avg=(`2016`+`2017`+`2018`+`2019`)/4) %>% select(geo, variable, `2020`, avg) %>% rename("Week"="variable")
+```
+
+```{r}
+rbind(totalexcess%>% mutate(no=str_length(geo)) %>% filter(no==2) %>% select(-no),
+NE %>% rename("avg"="Avg", "2020"="deaths"), DE_total) %>% write.csv("curves.csv")
+```
+
+
